@@ -1,18 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"path"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 	"os"
 
-	"github.com/globalsign/mgo"
+	"gopkg.in/mgo.v2/bson"
 	igc "github.com/marni/goigc"
 )
 
@@ -22,20 +21,61 @@ import (
 // http://skypolaris.org/wp-content/uploads/IGS%20Files/Boavista%20Medellin.igc
 // http://skypolaris.org/wp-content/uploads/IGS%20Files/Medellin%20Guatemala.igc
 
-// URLTrack - Keep track of the url(s) used for adding the igc file
-type URLTrack struct {
-	trackName string
-	track     igc.Track
+//MetaInfo for easy metainfo use
+type MetaInfo struct {
+	Uptime  string `json:"uptime"`
+	Info    string `json:"info"`
+	Version string `json:"version"`
 }
 
-// Keep count of the number of igc files added to the system
-var igcFileCount = 1
+//Track stores data about the track
+type URLTrack struct {
+	ID          string
+	HDate       time.Time `json:"H_Date"`
+	Pilot       string    `json:"pilot"`
+	Glider      string    `json:"glider"`
+	GliderID    string    `json:"glider_id"`
+	TrackLength float64   `json:"track_length"`
+	URL         string    `json:"track_src_url"`
+	TimeStamp bson.ObjectId
+}
 
+//Ticker stores info used for ticker
+type Ticker struct {
+	TLatest    bson.ObjectId `json:"t_latest"`
+	TStart     bson.ObjectId `json:"t_start"`
+	TStop      bson.ObjectId `json:"t_stop"`
+	Tracks     []string      `json:"tracks"`
+	Processing string 	 `json:"processing"`
+}
+
+//Webhook stores webhook info
+type Webhook struct {
+	ID       string
+	URL      string `json:"webhookURL"`
+	Value    int    `json:"minTriggerValue"`
+	TrackAdd int
+
+}
+
+//WebhookMessage stores data for the webhook to send
+type WebhookMessage struct {
+	TLatest    bson.ObjectId `json:"t_latest"`
+	Tracks     []string      `json:"tracks"`
+	Processing string`json:"processing"`
+}
+
+type WebHookSend struct {
+	Message WebhookMessage `json:"text"`
+}
+
+// VARIABLES:
+// timestamp when the service started
+var timeStarted time.Time
+// Keep count of the number of igc files added to the system
+var igcCount int
 // Map where the igcFiles are in-memory stored
 var igcFiles = make(map[string]URLTrack) // map["URL"]urlTrack
-
-// Unix timestamp when the service started
-var timeStarted = int(time.Now().Unix())
 
 // makes sure that the same track isn't added twice
 func urlInMap(url string) bool {
@@ -47,19 +87,9 @@ func urlInMap(url string) bool {
 	return false
 }
 
-// Get the index of the track in the igcFiles slice, if it is there
-func getTrackIndex(trackName string) string {
-	for url, track := range igcFiles {
-		if track.trackName == trackName {
-			return url
-		}
-	}
-	return ""
-}
-
 // ISO8601 duration parsing function
-func parseTimeDifference(timeDifference int) string {
-
+func parseTimeDifference() string {
+	var timeDifference int
 	result := "P" // Different time intervals are attached to this, if they are != 0
 	// Formulas for calculating different time intervals in seconds
 	timeLeft := timeDifference
@@ -105,6 +135,11 @@ func parseTimeDifference(timeDifference int) string {
 	return result
 }
 
+//Bad Request error message function as it is used many times
+func error400(w http.ResponseWriter) {
+	http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+}
+
 // Calculate the total distance of the track
 func calculateTotalDistance(track igc.Track) string {
 	totDistance := 0.0
@@ -116,72 +151,103 @@ func calculateTotalDistance(track igc.Track) string {
 	return strconv.FormatFloat(totDistance, 'f', 2, 64)
 }
 
-// Check if any of the regex patterns supplied in the map parameter match the string parameter
-func regexMatches(url string, urlMap map[string]func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
-	for mapURL := range urlMap {
-		res, err := regexp.MatchString(mapURL, url)
-		if err != nil {
-			return nil
-		}
-
-		if res { // If the pattern matching returns true, return the function
-			return urlMap[mapURL]
-		}
-	}
-	return nil
+func paraglideHandler(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/paragliding/api/", http.StatusSeeOther)
 }
 
-func paraglideHandler(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, "^/paragliding/api$", http.StatusSeeOther)
-}
 func apiHandler(w http.ResponseWriter, r *http.Request) {	
-	w.Header().Set("Content-Type", "application/json") // Set response content-type to JSON
+	w.Header().Set("Content-Type", "application/json")
 
-	timeNow := int(time.Now().Unix()) // Unix timestamp when the handler was called
+	parts := strings.Split(r.URL.Path, "/")
 
-	duration := parseTimeDifference(timeNow - timeStarted) // Calculate the time elapsed by subtracting the times
+	if len(parts) != 4 {
+		errRouter(w, r)
+		return
+	}
 
-	response := "{"
-	response += "\"uptime\": \"" + duration + "\","
-	response += "\"info\": \"Service for Paragliding tracks.\","
-	response += "\"version\": \"v1\""
-	response += "}"
-	fmt.Fprintln(w, response)
+	upTime := strings.Split(parseTimeDifference(), ".")
+	meta := MetaInfo{upTime[0], Info, Version}
+	metaJSON, err := json.Marshal(meta)
+	if err != nil {
+		panic(err)
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write(metaJSON)
 }
 
 func trackHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "POST" { // If method is POST, user has entered the URL
+		if r.Body == nil {
+			error400(w)
+			return
+		}
+
 		var data string // POST body is of content-type: JSON; the result can be stored in a map
+
 		err := json.NewDecoder(r.Body).Decode(&data)
 		if err != nil {
-			panic(err)
+			error400(w)
+			return
 		}
 
-		track, err := igc.ParseLocation(data["url"]) // call the igc library
+		track, err := igc.ParseLocation(data) // call the igc library
 		if err != nil {
-			panic(err)
+			error400(w)
+			return
+		}
+		igcCount++            // Increase the count
+		nID := "igc" + strconv.Itoa(igcCount)
+
+		newTrack := Track{
+			ID,
+			track.HDate,
+			track.Pilot,
+			track.GliderType,
+			track.GliderID,
+			parseTimeDifference(track),
+			data,
+			bson.NewObjectIdWithTime(time.Now())}
+
+		trackDataBase.Add(newTrack)
+
+		addJSON, err := json.Marshal(newTrack.ID)
+		if err != nil {
+			error400(w)
+			return
 		}
 
-		// Check if track map contains the url
-		// Or if the map is empty
-		if !urlInMap(data["url"]) || len(igcFiles) == 0 {
-			igcFiles[data["url"]] = URLTrack{"igc" + strconv.Itoa(igcFileCount), track} // Add the result to igcFiles map
-			igcFileCount++                                                              // Increase the count
-		}
-		response := "{"
-		response += "\"id\": " + "\"" + igcFiles[data["url"]].trackName + "\""
-		response += "}"
-		w.Header().Set("Content-Type", "application/json") // Set response content-type to JSON
-		fmt.Fprintf(w, response)
+		w.WriteHeader(http.StatusOK)
+		w.Write(addJSON)
+
+		sendWebhook(w)
 
 	} else if r.Method == "GET" { // If the method is GET
 		w.Header().Set("Content-Type", "application/json") // Set response content-type to JSON
 
-		y := 0 // numeric iterator
+		response := []string{}
+		for i := deletedTracks + 1; i <= total; i++ {
+			tempTrack, ok := trackDataBase.Get("igc" + strconv.Itoa(i))
+			if !ok {
+				error400(w)
+				return
+			}
+			response = append(response, tempTrack.ID)
+		}
 
-		response := "["
-		for j := range igcFiles { // Get all the IDs of .igc files stored in the igcFiles map
+		IDJSON, err := json.Marshal(response)
+		if err != nil {
+			error400(w)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write(IDJSON)
+
+	} else {
+		error400(w)
+	}
+		/*for i := igcFiles { // Get all the IDs of .igc files stored in the igcFiles map
 			if y != len(igcFiles)-1 { // If it's the last item in the array, don't add the ","
 				response += "\"" + igcFiles[j].trackName + "\","
 				y++ // Increment the iterator
@@ -192,22 +258,22 @@ func trackHandler(w http.ResponseWriter, r *http.Request) {
 		response += "]"
 
 		fmt.Fprintf(w, response)
-	}
+	}*/
 }
 
 func idHandler(w http.ResponseWriter, r *http.Request) {
-	urlID := path.Base(r.URL.Path) // returns the part after the last '/' in the url
+	w.Header().Set("Content-Type", "application/json") // Set response content-type to JSON
+	urlID := strings.Split(r.URL.Path, "/") // returns the part after the last '/' in the url
 
-	trackURL := getTrackIndex(urlID)
-	if trackURL != "" { // Check whether the url is different from an empty string
-		w.Header().Set("Content-Type", "application/json") // Set response content-type to JSON
+	track := getTrackIndex(urlID)
+	if track != "" { // Check whether the url is different from an empty string
 
 		response := "{"
-		response += "\"H_date\": " + "\"" + igcFiles[trackURL].track.Date.String() + "\","
-		response += "\"pilot\": " + "\"" + igcFiles[trackURL].track.Pilot + "\","
-		response += "\"glider\": " + "\"" + igcFiles[trackURL].track.GliderType + "\","
-		response += "\"glider_id\": " + "\"" + igcFiles[trackURL].track.GliderID + "\","
-		response += "\"track_length\": " + "\"" + calculateTotalDistance(igcFiles[trackURL].track) + "\"" 
+		response += "\"H_date\": " + "\"" + igcFiles[track].track.Date.String() + "\","
+		response += "\"pilot\": " + "\"" + igcFiles[track].track.Pilot + "\","
+		response += "\"glider\": " + "\"" + igcFiles[track].track.GliderType + "\","
+		response += "\"glider_id\": " + "\"" + igcFiles[track].track.GliderID + "\","
+		response += "\"track_length\": " + "\"" + calculateTotalDistance(igcFiles[track].track) + "\"" 
 		response += "}"
 		fmt.Fprintf(w, response)
 	} else {
@@ -240,7 +306,7 @@ func fieldHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func tickerHandler(w http.ResponseWriter, r *http.Request) {
+/*func tickerHandler(w http.ResponseWriter, r *http.Request) {
 	urlID := path.Base(r.URL.Path) // returns the part after the last '/' in the url
 
 	trackURL := getTrackIndex(urlID)
@@ -248,38 +314,357 @@ func tickerHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json") // Set response content-type to JSON
 
 		response := "{"
-		/*response += "\"t_latest\": " + "\"" + igcFiles[trackURL].track.Date.String() + "\","
+		response += "\"t_latest\": " + "\"" + igcFiles[trackURL].track.Date.String() + "\","
 		response += "\"t_start\": " + "\"" + <start> + "\","
 		response += "\"t_stop\": " + "\"" + <stop> + "\","
 		response += "\"tracks\": " + "\"" + <tracks> + "\","
-		response += "\"processing\": " + "\"" + <processing> + "\"" */
+		response += "\"processing\": " + "\"" + <processing> + "\"" 
 		response += "}"
 		fmt.Fprintf(w, response)
 	} else {
 		w.WriteHeader(http.StatusNotFound) // If it isn't, send a 404 Not Found status
 	}
+}*/
+
+func tickerLast(w http.ResponseWriter, r *http.Request) {
+	if urlAmount == 0 {
+		error400(w)
+		return
+	}
+	tempTimeStamp, ok := trackDataBase.Get("igc" + strconv.Itoa(urlAmount))
+	if !ok {
+		error400(w)
+		return
+	}
+	fmt.Fprint(w, tempTimeStamp.TimeStamp)
 }
 
-func urlRouter(w http.ResponseWriter, r *http.Request) {
-	urlMap := map[string]func(http.ResponseWriter, *http.Request){ // A map of accepted URL RegEx patterns
-		"^/paragliding$":			paraglideHandler,
-		"^/paragliding/api$":                      apiHandler,
-		"^/paragliding/api/track$":                   trackHandler,
-		"^/paragliding/api/track/[a-zA-Z0-9]{3,10}$": idHandler,
-		"^/paragliding/api/track/[a-zA-Z0-9]{3,10}/(pilot|glider|glider_id|track_length|H_date)$": fieldHandler,
-		"^/paragliding/api/ticker$":			tickerHandler,
+func ticker(w http.ResponseWriter, r *http.Request) {
+	processStart := time.Now().UnixNano() / int64(time.Millisecond)
+	arrayCap := 5
+
+	var startTime bson.ObjectId
+	var stopTime bson.ObjectId
+
+	tracks := []string{}
+
+	for i := deletedTracks + 1; i <= arrayCap + deletedTracks; i++ {
+		tempTimeStamp, ok := trackDataBase.Get("igc" + strconv.Itoa(i))
+		if !ok {
+			break
+		}
+		tracks = append(tracks, tempTimeStamp.ID)
+
+		if i == 1 {
+			startTime = tempTimeStamp.TimeStamp
+		}
+		//Defined here many times in case there are less than 5 tracks
+		stopTime = tempTimeStamp.TimeStamp
 	}
 
-	result := regexMatches(r.URL.Path, urlMap) // Perform the RegEx check to see if any pattern matches
-
-	if result != nil { // If a function is returned, call that handler function
-		result(w, r)
-	} else {
-		w.WriteHeader(http.StatusNotFound) // If no function is returned, send a 404 Not Found status
+	trackTotal := trackDataBase.Count()
+	lastTimeStamp, ok := trackDataBase.Get("igc" + strconv.Itoa(trackTotal))
+	if !ok {
+		error400(w)
+		return
 	}
+
+	latest := lastTimeStamp.TimeStamp
+
+	process := (time.Now().UnixNano() / int64(time.Millisecond)) - processStart
+	processString := strconv.FormatInt(process, 10)
+
+	response := Ticker{latest, startTime, stopTime, tracks, processString}
+
+	tickerJSON, err := json.Marshal(response)
+	if err != nil {
+		error400(w)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(tickerJSON)
+}
+
+func tickerTimeStamp(w http.ResponseWriter, r *http.Request) {
+	processStart := time.Now().UnixNano() / int64(time.Millisecond)
+	arrayCap := 5
+
+	parts := strings.Split(r.URL.Path, "/")
+	stamp := bson.ObjectIdHex(parts[len(parts)-1])
+
+	var startTime bson.ObjectId
+	var stopTime bson.ObjectId
+
+	low := 1
+
+	for {
+		tempTimeStamp, ok := trackDataBase.Get("igc" + strconv.Itoa(low))
+		if !ok {
+			error400(w)
+			return
+		}
+
+		if stamp > tempTimeStamp.TimeStamp {
+			break
+		}
+		low++
+	}
+
+	tracks := []string{}
+
+	for i := low; i <= arrayCap+low; i++ {
+		tempTimeStamp, ok := trackDataBase.Get("igc" + strconv.Itoa(i))
+		if !ok {
+			break
+		}
+		tracks = append(tracks, tempTimeStamp.ID)
+
+		if i == 1 {
+			startTime = tempTimeStamp.TimeStamp
+		}
+		//Defined here many times in case there are less than 5 tracks
+		stopTime = tempTimeStamp.TimeStamp
+	}
+
+	trackTotal := trackDataBase.Count()
+	lastTimeStamp, ok := trackDataBase.Get("igc" + strconv.Itoa(trackTotal))
+	if !ok {
+		error400(w)
+		return
+	}
+
+	latest := lastTimeStamp.TimeStamp
+
+	process := (time.Now().UnixNano() / int64(time.Millisecond)) - processStart
+	processString := strconv.FormatInt(process, 10)
+
+	response := Ticker{latest, startTime, stopTime, tracks, processString}
+
+	tickerJSON, err := json.Marshal(response)
+	if err != nil {
+		error400(w)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(tickerJSON)
+}
+
+func newWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		error400(w)
+	}
+
+	var newWebhook Webhook
+
+	err := json.NewDecoder(r.Body).Decode(&newWebhook)
+	if err != nil {
+		error400(w)
+		return
+	}
+
+	if newWebhook.Value == 0 {
+		newWebhook.Value = 1
+	}
+
+	webhookAmount++
+	newWebhook.ID = strconv.Itoa(webhookAmount)
+	newWebhook.TrackAdd = urlAmount
+
+	webhookDataBase.Add(newWebhook)
+
+	fmt.Fprintf(w, newWebhook.ID)
+}
+
+func sendWebhook(w http.ResponseWriter) {
+	processStart := time.Now().UnixNano() / int64(time.Millisecond)
+
+	hooks := webhookDataBase.Count()
+	if hooks == 0 {
+		return
+	}
+
+	for i := deletedTracks + 1; i <= hooks + deletedTracks; i++ {
+		tempWH, ok := webhookDataBase.Get(strconv.Itoa(i))
+		if !ok {
+			error400(w)
+			return
+		}
+		if tempWH.TrackAdd + tempWH.Value == urlAmount + deletedTracks {
+			tempTimeStamp, ok := trackDataBase.Get("igc" + strconv.Itoa(urlAmount))
+			if !ok {
+				error400(w)
+				return
+			}
+			tracks := []string{}
+			for i := tempWH.TrackAdd + 1; i <= urlAmount + deletedTracks; i++ {
+				track, ok := trackDataBase.Get("igc" + strconv.Itoa(i))
+				if !ok {
+					error400(w)
+					return
+				}
+				tracks = append(tracks, track.ID)
+			}
+
+			process := (time.Now().UnixNano() / int64(time.Millisecond)) - processStart
+			processString := strconv.FormatInt(process, 10)
+
+			messageBody := WebhookMessage{tempTimeStamp.TimeStamp, tracks, processString}
+
+			message := WebHookSend{messageBody}
+
+			messageJSON, err := json.Marshal(message)
+
+			if err != nil {
+				error400(w)
+				return
+			}
+
+			tempWH.TrackAdd = urlAmount + deletedTracks
+			ok = webhookDataBase.Delete("igc" + strconv.Itoa(i))
+			if !ok {
+				error400(w)
+				return
+			}
+
+			webhookDataBase.Add(tempWH)
+
+			resp, err := http.Post(tempWH.URL, "application/json", bytes.NewBuffer(messageJSON))
+
+			var result map[string]interface{}
+
+			json.NewDecoder(resp.Body).Decode(&result)
+
+			log.Println(result)
+			log.Println(result["data"])
+		}
+	}
+}
+
+func manageWebhook(w http.ResponseWriter, r *http.Request) {
+
+	parts := strings.Split(r.URL.Path, "/")
+	ID := parts[len(parts)-1]
+
+	if r.Method == "GET" {
+		tempWH, ok := webhookDataBase.Get(ID)
+		if !ok {
+			error400(w)
+			return
+		}
+
+		resp, err := json.Marshal(tempWH)
+		if err != nil {
+			error400(w)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(resp)
+	} else if r.Method == "DELETE" {
+		tempWH, ok := webhookDataBase.Get(ID)
+		if !ok {
+			error400(w)
+			return
+		}
+
+		ok = webhookDataBase.Delete(ID)
+		if !ok {
+			error400(w)
+			return
+		}
+
+		resp, err := json.Marshal(tempWH)
+		if err != nil {
+			error400(w)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(resp)
+	}
+}
+
+func clockTrigger() {
+	if clockSaved < urlAmount + deletedTracks {
+		processStart := time.Now().UnixNano() / int64(time.Millisecond)
+
+		 tracks := []string{}
+		 var tLate bson.ObjectId
+
+		for i := clockSaved + 1; i <= urlAmount + deletedTracks; i++ {
+			tempTrack, ok := trackDataBase.Get("igc" + strconv.Itoa(i))
+			if !ok {
+				panic(ok)
+			}
+			tracks = append(tracks, tempTrack.ID)
+
+			if i == urlAmount + deletedTracks {
+				tLate = tempTrack.TimeStamp
+			}
+		}
+
+		process := (time.Now().UnixNano() / int64(time.Millisecond)) - processStart
+		processString := strconv.FormatInt(process, 10)
+		messageBody := WebhookMessage{tLate,tracks,processString}
+
+		message := WebHookSend{messageBody}
+
+		messageJSON, err := json.Marshal(message)
+		if err != nil {
+			panic(err)
+		}
+
+		//SlackURL is hidden in another file not posted to github to ensure no spam to it
+		resp, err := http.Post(SlackURL, "application/json", bytes.NewBuffer(messageJSON))
+
+		var result map[string]interface{}
+
+		json.NewDecoder(resp.Body).Decode(&result)
+
+		log.Println(result)
+		log.Println(result["data"])
+	}
+}
+
+func adminGet(w http.ResponseWriter, r *http.Request) {
+	count := trackDataBase.Count()
+	fmt.Fprint(w, count)
+}
+
+func adminDelete(w http.ResponseWriter, r *http.Request) {
+	count, ok := trackDataBase.Delete()
+	if !ok {
+		error400(w)
+		return
+	}
+	fmt.Fprint(w, count)
+}
+
+func errRouter(w http.ResponseWriter, r *http.Request) {
+	http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 }
 
 func main() {
-	http.HandleFunc("/", urlRouter)
+	trackDataBase.Init()
+	webhookDataBase.Init()
+	router := mux.NewRouter()
+
+	router.HandleFunc("/", errRouter)
+	router.HandleFunc("/paragliding/", paraglideHandler)
+	router.HandleFunc("/paragliding/api/", apiHandler)
+	router.HandleFunc("/paragliding/api/track/", trackHandler)
+	router.HandleFunc("/paragliding/api/track/[a-zA-Z0-9]{3,10}/", idHandler)
+	router.HandleFunc("/paragliding/api/track/[a-zA-Z0-9]{3,10}/(pilot|glider|glider_id|track_length|H_date)/", fieldHandler)
+	router.HandleFunc("/paragliding/api/ticker/latest", tickerLast)
+	router.HandleFunc("/paragliding/api/ticker/", ticker)
+	router.HandleFunc("/paragliding/api/ticker/{[0-9A-Za-z]}", tickerTimeStamp)
+	router.HandleFunc("/paragliding/api/webhook/new_track/", newWebhook)
+	router.HandleFunc("/paragliding/api/webhook/new_track/{[0-9A-Za-z]}", manageWebhook)
+	router.HandleFunc("/UnexpectedURL/admin/api/tracks_count", adminGet)
+	router.HandleFunc("/UnexpectedURL/admin/api/tracks", adminDelete)
 	log.Fatal(http.ListenAndServe(":" + os.Getenv("PORT"), nil))
 }
