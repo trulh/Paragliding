@@ -11,17 +11,179 @@ import (
 	"time"
 	"os"
 
+	"github.com/gorilla/mux"
+	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
-	igc "github.com/marni/goigc"
+	"github.com/marni/goigc"
 )
 
+type trackDB struct {
+	HostURL             string
+	DatabaseName        string
+	TrackCollectionName string
+}
+
+type webhookDB struct {
+	HostURL               string
+	DatabaseName          string
+	WebhookCollectionName string
+}
+
+func (db *trackDB) Init() {
+	session, err := mgo.Dial(db.HostURL)
+	if err != nil {
+		panic(err)
+	}
+
+	defer session.Close()
+
+}
+
+func (db *webhookDB) Init() {
+	session, err := mgo.Dial(db.HostURL)
+	if err != nil {
+		panic(err)
+	}
+
+	defer session.Close()
+
+}
+
+func (db *trackDB) Add(s Track) {
+	session, err := mgo.Dial(db.HostURL)
+	if err != nil {
+		panic(err)
+	}
+
+	defer session.Close()
+
+	err = session.DB(db.DatabaseName).C(db.TrackCollectionName).Insert(s)
+	if err != nil {
+		fmt.Printf("error in Insert(): %v", err.Error())
+	}
+}
+
+func (db *webhookDB) Add(s Webhook) {
+	session, err := mgo.Dial(db.HostURL)
+	if err != nil {
+		panic(err)
+	}
+
+	defer session.Close()
+
+	err = session.DB(db.DatabaseName).C(db.WebhookCollectionName).Insert(s)
+	if err != nil {
+		fmt.Printf("error in Insert(): %v", err.Error())
+	}
+}
+
+func (db *trackDB) Count() int {
+	session, err := mgo.Dial(db.HostURL)
+	if err != nil {
+		panic(err)
+	}
+
+	defer session.Close()
+
+	count, err := session.DB(db.DatabaseName).C(db.TrackCollectionName).Count()
+	if err != nil {
+		fmt.Printf("error in Count(): %v", err.Error())
+		return -1
+	}
+	return count
+
+}
+
+func (db *webhookDB) Count() int {
+	session, err := mgo.Dial(db.HostURL)
+	if err != nil {
+		panic(err)
+	}
+
+	defer session.Close()
+
+	count, err := session.DB(db.DatabaseName).C(db.WebhookCollectionName).Count()
+	if err != nil {
+		fmt.Printf("error in Count(): %v", err.Error())
+		return -1
+	}
+	return count
+
+}
+
+func (db *trackDB) Get(keyID string) (Track, bool) {
+	session, err := mgo.Dial(db.HostURL)
+	if err != nil {
+		panic(err)
+	}
+
+	defer session.Close()
+
+	track := Track{}
+	err = session.DB(db.DatabaseName).C(db.TrackCollectionName).Find(bson.M{"id": keyID}).One(&track)
+	if err != nil {
+		return track, false
+	}
+
+	return track, true
+}
+
+func (db *webhookDB) Get(keyID string) (Webhook, bool) {
+	session, err := mgo.Dial(db.HostURL)
+	if err != nil {
+		panic(err)
+	}
+
+	defer session.Close()
+
+	Hook := Webhook{}
+	err = session.DB(db.DatabaseName).C(db.WebhookCollectionName).Find(bson.M{"id": keyID}).One(&Hook)
+	if err != nil {
+		return Hook, false
+	}
+
+	return Hook, true
+}
+
+func (db *trackDB) Delete() (int, bool) {
+	session, err := mgo.Dial(db.HostURL)
+	if err != nil {
+		panic(err)
+	}
+
+	defer session.Close()
+	tracks := session.DB(db.DatabaseName).C(db.TrackCollectionName)
+
+	count, err := tracks.Count()
+	if err != nil {
+		return 0, false
+	}
+
+	tracks.RemoveAll(nil)
+	return count, true
+}
+
+func (db *webhookDB) Delete(keyID string) bool {
+	session, err := mgo.Dial(db.HostURL)
+	if err != nil {
+		panic(err)
+	}
+
+	defer session.Close()
+	err = session.DB(db.DatabaseName).C(db.WebhookCollectionName).Remove(bson.M{"id": keyID})
+	if err != nil {
+		return false
+	}
+
+	return true
+}
 // Some .igc files URLs for use in testing
 // http://skypolaris.org/wp-content/uploads/IGS%20Files/Madrid%20to%20Jerez.igc
 // http://skypolaris.org/wp-content/uploads/IGS%20Files/Jarez%20to%20Senegal.igc
 // http://skypolaris.org/wp-content/uploads/IGS%20Files/Boavista%20Medellin.igc
 // http://skypolaris.org/wp-content/uploads/IGS%20Files/Medellin%20Guatemala.igc
 
-//MetaInfo for easy metainfo use
+//MetaInfo struct for easy metainfo use
 type MetaInfo struct {
 	Uptime  string `json:"uptime"`
 	Info    string `json:"info"`
@@ -76,6 +238,12 @@ var timeStarted time.Time
 var igcCount int
 // Map where the igcFiles are in-memory stored
 var igcFiles = make(map[string]URLTrack) // map["URL"]urlTrack
+// Keep count of the number of webhooks
+var webhookAmount int
+
+//var clockSaved int
+var deletedTracks int
+
 
 // makes sure that the same track isn't added twice
 func urlInMap(url string) bool {
@@ -85,6 +253,14 @@ func urlInMap(url string) bool {
 		}
 	}
 	return false
+}
+
+func init() {
+	igcCount = 0
+	webhookAmount = 0
+	//clockSaved = 0
+	deletedTracks = 0
+	timeStarted = time.Now()
 }
 
 // ISO8601 duration parsing function
@@ -262,81 +438,99 @@ func trackHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func idHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json") // Set response content-type to JSON
-	urlID := strings.Split(r.URL.Path, "/") // returns the part after the last '/' in the url
+	w.Header().Set("Content-Type", "application/json")
 
-	track := getTrackIndex(urlID)
-	if track != "" { // Check whether the url is different from an empty string
+	parts := strings.Split(r.URL.Path, "/")
+	track := parts[len(parts)-1]
+	if track != "" {
 
-		response := "{"
-		response += "\"H_date\": " + "\"" + igcFiles[track].track.Date.String() + "\","
-		response += "\"pilot\": " + "\"" + igcFiles[track].track.Pilot + "\","
-		response += "\"glider\": " + "\"" + igcFiles[track].track.GliderType + "\","
-		response += "\"glider_id\": " + "\"" + igcFiles[track].track.GliderID + "\","
-		response += "\"track_length\": " + "\"" + calculateTotalDistance(igcFiles[track].track) + "\"" 
-		response += "}"
-		fmt.Fprintf(w, response)
+		tempTrack, ok := trackDataBase.Get(track)
+
+		if !ok {
+			error400(w)
+			return
+		}
+
+		trackJSON, err := json.Marshal(tempTrack)
+
+		if err != nil {
+			error400(w)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Write(trackJSON)
+
 	} else {
-		w.WriteHeader(http.StatusNotFound) // If it isn't, send a 404 Not Found status
+		errRouter(w, r) // If it isn't, send a 404 Not Found status
 	}
 }
 
 func fieldHandler(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(r.URL.Path, "/")
 
-	pathArray := strings.Split(r.URL.Path, "/") // split the URL Path into parts, whenever there's a "/"
-	field := pathArray[len(pathArray)-1]        // The part after the last "/", is the field
-	uniqueID := pathArray[len(pathArray)-2]     // The part after the second to last "/", is the unique ID
+	id := parts[len(parts)-2]
+	field := parts[len(parts)-1]
 
-	trackURL := getTrackIndex(uniqueID)
+	if id != "" && field != "" {
 
-	if trackURL != "" { // Check whether the url is different from an empty string
+		tempTrack, ok := trackDataBase.Get(id)
 
-		something := map[string]string{ // Map the field to one of the Track struct attributes in the igcFiles slice
-			"pilot":        igcFiles[trackURL].track.Pilot,
-			"glider":       igcFiles[trackURL].track.GliderType,
-			"glider_id":    igcFiles[trackURL].track.GliderID,
-			"track_length": calculateTotalDistance(igcFiles[trackURL].track),
-			"H_date":       igcFiles[trackURL].track.Date.String(),
+		if !ok {
+			error400(w)
 		}
 
-		response := something[field] // This will work because the RegEx checks whether the name is written correctly
-		fmt.Fprintf(w, response)
+		switch field {
+		case "pilot":
+			Response := tempTrack.Pilot
+
+			response, err := errorCheck(Response)
+			if err != nil {
+				error400(w)
+				return
+			}
+			fmt.Fprint(w, response)
+		case "glider":
+			Response := tempTrack.Glider
+
+			response, err := errorCheck(Response)
+			if err != nil {
+				error400(w)
+				return
+			}
+			fmt.Fprint(w, response)
+		case "glider_id":
+			Response := tempTrack.GliderID
+			response, err := errorCheck(Response)
+			if err != nil {
+				error400(w)
+				return
+			}
+			fmt.Fprint(w, response)
+		case "track_length":
+			fmt.Fprint(w, tempTrack.TrackLength)
+		case "H_date":
+			Response := tempTrack.HDate.String()
+
+			response, err := errorCheck(Response)
+			if err != nil {
+				error400(w)
+				return
+			}
+			fmt.Fprint(w, response)
+		case "track_src_url":
+			Response := tempTrack.URL
+
+			response, err := errorCheck(Response)
+			if err != nil {
+				error400(w)
+				return
+			}
+			fmt.Fprint(w, response)
+		}
 	} else {
-		w.WriteHeader(http.StatusNotFound) // sends error if field is not written correctly
+		errRouter(w, r)
 	}
-}
-
-/*func tickerHandler(w http.ResponseWriter, r *http.Request) {
-	urlID := path.Base(r.URL.Path) // returns the part after the last '/' in the url
-
-	trackURL := getTrackIndex(urlID)
-	if trackURL != "" { // Check whether the url is different from an empty string
-		w.Header().Set("Content-Type", "application/json") // Set response content-type to JSON
-
-		response := "{"
-		response += "\"t_latest\": " + "\"" + igcFiles[trackURL].track.Date.String() + "\","
-		response += "\"t_start\": " + "\"" + <start> + "\","
-		response += "\"t_stop\": " + "\"" + <stop> + "\","
-		response += "\"tracks\": " + "\"" + <tracks> + "\","
-		response += "\"processing\": " + "\"" + <processing> + "\"" 
-		response += "}"
-		fmt.Fprintf(w, response)
-	} else {
-		w.WriteHeader(http.StatusNotFound) // If it isn't, send a 404 Not Found status
-	}
-}*/
-
-func tickerLast(w http.ResponseWriter, r *http.Request) {
-	if urlAmount == 0 {
-		error400(w)
-		return
-	}
-	tempTimeStamp, ok := trackDataBase.Get("igc" + strconv.Itoa(urlAmount))
-	if !ok {
-		error400(w)
-		return
-	}
-	fmt.Fprint(w, tempTimeStamp.TimeStamp)
 }
 
 func ticker(w http.ResponseWriter, r *http.Request) {
@@ -472,7 +666,7 @@ func newWebhook(w http.ResponseWriter, r *http.Request) {
 
 	webhookAmount++
 	newWebhook.ID = strconv.Itoa(webhookAmount)
-	newWebhook.TrackAdd = urlAmount
+	newWebhook.TrackAdd = igcCount
 
 	webhookDataBase.Add(newWebhook)
 
@@ -493,14 +687,14 @@ func sendWebhook(w http.ResponseWriter) {
 			error400(w)
 			return
 		}
-		if tempWH.TrackAdd + tempWH.Value == urlAmount + deletedTracks {
-			tempTimeStamp, ok := trackDataBase.Get("igc" + strconv.Itoa(urlAmount))
+		if tempWH.TrackAdd + tempWH.Value == igcCount + deletedTracks {
+			tempTimeStamp, ok := trackDataBase.Get("igc" + strconv.Itoa(igcCount))
 			if !ok {
 				error400(w)
 				return
 			}
 			tracks := []string{}
-			for i := tempWH.TrackAdd + 1; i <= urlAmount + deletedTracks; i++ {
+			for i := tempWH.TrackAdd + 1; i <= igcCount + deletedTracks; i++ {
 				track, ok := trackDataBase.Get("igc" + strconv.Itoa(i))
 				if !ok {
 					error400(w)
@@ -523,7 +717,7 @@ func sendWebhook(w http.ResponseWriter) {
 				return
 			}
 
-			tempWH.TrackAdd = urlAmount + deletedTracks
+			tempWH.TrackAdd = igcCount + deletedTracks
 			ok = webhookDataBase.Delete("igc" + strconv.Itoa(i))
 			if !ok {
 				error400(w)
@@ -588,21 +782,21 @@ func manageWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func clockTrigger() {
-	if clockSaved < urlAmount + deletedTracks {
+/*func clockTrigger() {
+	if clockSaved < igcCount + deletedTracks {
 		processStart := time.Now().UnixNano() / int64(time.Millisecond)
 
 		 tracks := []string{}
 		 var tLate bson.ObjectId
 
-		for i := clockSaved + 1; i <= urlAmount + deletedTracks; i++ {
+		for i := clockSaved + 1; i <= igcCount + deletedTracks; i++ {
 			tempTrack, ok := trackDataBase.Get("igc" + strconv.Itoa(i))
 			if !ok {
 				panic(ok)
 			}
 			tracks = append(tracks, tempTrack.ID)
 
-			if i == urlAmount + deletedTracks {
+			if i == igcCount + deletedTracks {
 				tLate = tempTrack.TimeStamp
 			}
 		}
@@ -628,7 +822,7 @@ func clockTrigger() {
 		log.Println(result)
 		log.Println(result["data"])
 	}
-}
+}*/
 
 func adminGet(w http.ResponseWriter, r *http.Request) {
 	count := trackDataBase.Count()
